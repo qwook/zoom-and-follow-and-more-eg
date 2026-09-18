@@ -18,6 +18,18 @@ local ZOOM_HOTKEY_NAME = "zoom_and_follow.zoom.toggle"
 local FOLLOW_HOTKEY_NAME = "zoom_and_follow.follow.toggle"
 local CROP_FILTER_NAME = "zoom_and_follow_crop"
 local MAX_DISPLAYS = 32 -- Maximum displays for macOS
+local CURSOR_OVERLAY_SOURCE_NAME = "Zoom Follow Cursor Overlay"
+
+-- Best-effort fallback paths for the stock system cursor, used only when the
+-- user leaves a cursor image field blank. macOS ships no easily-readable
+-- cursor image files (they live as private resources inside frameworks), so
+-- there is no fallback there: leave the field blank and the overlay simply
+-- skips drawing that type and logs a warning once.
+local DEFAULT_CURSOR_FALLBACK_PATHS = {
+    Windows = {
+        default = "C:\\Windows\\Cursors\\aero_arrow.cur",
+    },
+}
 
 -- Default values (will be overridden by script settings)
 local DEFAULT_UPDATE_INTERVAL = 16 -- milliseconds (approximately 60 FPS)
@@ -26,9 +38,14 @@ local DEFAULT_ZOOM_ANIMATION_DURATION = 300 -- milliseconds
 local DEFAULT_ZOOM_OUT_DURATION = 500 -- milliseconds
 local DEFAULT_SCENE_TRANSITION_DURATION = 300 -- milliseconds
 local DEFAULT_MOUSE_DEADZONE = 3 -- pixels: minimum mouse movement to trigger crop update
+local FOLLOW_CONTINUE_MS = 500 -- once the mouse clears the deadzone, keep tracking every tick
+                                 -- (ignoring the deadzone) for this long, refreshed by further
+                                 -- movement, so slow panning doesn't step in deadzone-sized jumps
 local DEFAULT_CROP_UPDATE_THRESHOLD = 2 -- pixels: minimum crop change to trigger update
 local DEFAULT_CROP_EDGE_THRESHOLD = 5 -- pixels: increased threshold when crop is at edges
 local MAX_ZOOM_VALUE = 100.0 -- Maximum zoom multiplier; practical limit depends on source resolution
+local DEFAULT_CROP_RESOLUTION_WIDTH = 1080 -- Default vertical/portrait crop resolution (e.g. 1080x1920)
+local DEFAULT_CROP_RESOLUTION_HEIGHT = 1920
 local DEFAULT_MONITOR_WIDTH = 1920
 local DEFAULT_MONITOR_HEIGHT = 1080
 
@@ -123,6 +140,7 @@ local function init_windows_ffi()
             BOOL GetMonitorInfoA(HMONITOR, MONITORINFO*);
             typedef struct { long x; long y; } POINT;
             bool GetCursorPos(POINT* point);
+            short GetAsyncKeyState(int vKey);
         ]]
         ffi_platform.windows_loaded = true
     end)
@@ -290,19 +308,41 @@ local function init_macos_ffi()
     
     local success, err = pcall(function()
         ffi.cdef[[
-            typedef struct CGDirectDisplayID *CGDirectDisplayID;
+            typedef double CGFloat;
+            typedef uint32_t CGDirectDisplayID;
             typedef uint32_t CGDisplayCount;
-            typedef struct CGRect CGRect;
-            typedef struct CGPoint CGPoint;
+            typedef int32_t CGError;
+            typedef struct {
+                CGFloat x;
+                CGFloat y;
+            } CGPoint;
+            typedef struct {
+                CGFloat width;
+                CGFloat height;
+            } CGSize;
+            typedef struct {
+                CGPoint origin;
+                CGSize size;
+            } CGRect;
             
-            int CGGetActiveDisplayList(CGDisplayCount maxDisplays, CGDirectDisplayID *activeDisplays, CGDisplayCount *displayCount);
+            CGError CGGetActiveDisplayList(CGDisplayCount maxDisplays, CGDirectDisplayID *activeDisplays, CGDisplayCount *displayCount);
             CGRect CGDisplayBounds(CGDirectDisplayID display);
+            CGDirectDisplayID CGMainDisplayID(void);
             CGPoint CGEventGetLocation(void* event);
             void* CGEventCreate(void* source);
             void CFRelease(void* cf);
+            bool CGEventSourceButtonState(int stateID, int button);
+            void* CGColorCreateGenericRGB(double red, double green, double blue, double alpha);
         ]]
         
-        ffi_platform.core_graphics = ffi.load("CoreGraphics", true)
+        -- A bare "CoreGraphics" name becomes a relative libCoreGraphics.dylib
+        -- lookup, which hardened/notarized OBS builds reject on modern macOS.
+        -- The canonical absolute framework path is resolved by dyld even when
+        -- the framework binary itself lives in the shared cache.
+        ffi_platform.core_graphics = ffi.load(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            true
+        )
     end)
     
     if not success then
@@ -525,6 +565,315 @@ function ffi_platform.get_mouse_pos()
     return x, y
 end
 
+-- Test a single-bit mask, with a fallback when the LuaJIT bit library isn't
+-- available. Values here (VK high bit, X11 ButtonNMask) are always one bit,
+-- so the arithmetic fallback (same trick as has_flag() below) is exact.
+local function has_bit(value, mask)
+    if value == nil or mask == nil or mask == 0 then
+        return false
+    end
+    if bit then
+        return bit.band(value, mask) ~= 0
+    end
+    return (math.floor(value / mask) % 2) == 1
+end
+
+-- Returns true if the left or right mouse button is currently held down.
+-- Best-effort: returns false (never blocks/errors) if the platform call fails
+-- or isn't available (e.g. Wayland has no reliable way to read this either).
+function ffi_platform.get_mouse_buttons()
+    if not ffi_platform.initialized then
+        return false
+    end
+
+    if ffi_platform.os_type == "Windows" then
+        local ok, down = pcall(function()
+            local VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
+            -- High bit set = currently down.
+            local left = has_bit(ffi.C.GetAsyncKeyState(VK_LBUTTON), 0x8000)
+            local right = has_bit(ffi.C.GetAsyncKeyState(VK_RBUTTON), 0x8000)
+            return left or right
+        end)
+        return ok and down or false
+
+    elseif ffi_platform.os_type == "Linux" then
+        if ffi_platform.x11_display == nil then return false end
+        local ok, down = pcall(function()
+            local root_x = ffi.new("int[1]")
+            local root_y = ffi.new("int[1]")
+            local win_x = ffi.new("int[1]")
+            local win_y = ffi.new("int[1]")
+            local mask = ffi.new("unsigned int[1]")
+            local child = ffi.new("Window[1]")
+            local child_revert = ffi.new("Window[1]")
+            if ffi_platform.x11.XQueryPointer(ffi_platform.x11_display, ffi_platform.x11_root,
+                                              child_revert, child, root_x, root_y, win_x, win_y, mask) ~= 0 then
+                local Button1Mask, Button3Mask = 0x100, 0x400 -- left, right
+                return has_bit(mask[0], Button1Mask) or has_bit(mask[0], Button3Mask)
+            end
+            return false
+        end)
+        return ok and down or false
+
+    elseif ffi_platform.os_type == "OSX" then
+        if ffi_platform.core_graphics == nil then return false end
+        local ok, down = pcall(function()
+            local kCGEventSourceStateHIDSystemState = 1
+            local kCGMouseButtonLeft, kCGMouseButtonRight = 0, 1
+            local left = ffi_platform.core_graphics.CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonLeft)
+            local right = ffi_platform.core_graphics.CGEventSourceButtonState(kCGEventSourceStateHIDSystemState, kCGMouseButtonRight)
+            return left or right
+        end)
+        return ok and down or false
+    end
+
+    return false
+end
+
+-- Lazily bind to NSCursor via the Objective-C runtime and cache the singleton
+-- pointers for the handful of system cursor shapes we care about. macOS has
+-- no public C API for "what shape is the cursor right now"; NSCursor is
+-- undocumented for this use but returns the SAME object each time for a
+-- given standard shape, so a pointer comparison is enough — no image
+-- decoding or pixel work needed. Entirely best-effort: any failure (missing
+-- symbol, unexpected runtime layout, a future macOS removing this) leaves
+-- shape detection permanently off for the session and callers fall back to
+-- the default cursor image, never an error.
+local function init_macos_cursor_shape()
+    if ffi_platform.macos_cursor_shape_init_done then
+        return ffi_platform.macos_cursor_shape_available
+    end
+    ffi_platform.macos_cursor_shape_init_done = true
+    ffi_platform.macos_cursor_shape_available = false
+
+    pcall(function()
+        ffi.cdef[[
+            void* objc_getClass(const char* name);
+            void* sel_registerName(const char* name);
+            void* objc_msgSend(void* self, void* op);
+        ]]
+        local objc = ffi.load("/usr/lib/libobjc.A.dylib", true)
+
+        local NSCursor = objc.objc_getClass("NSCursor")
+        if NSCursor == nil then error("NSCursor class not found") end
+
+        local sel_current = objc.sel_registerName("currentSystem")
+        local sel_arrow = objc.sel_registerName("arrowCursor")
+        local sel_ibeam = objc.sel_registerName("IBeamCursor")
+        local sel_hand = objc.sel_registerName("pointingHandCursor")
+
+        -- Resolve the singleton pointers once; comparing against these on
+        -- every tick is just a pointer compare, not a class dispatch.
+        local arrow_ptr = objc.objc_msgSend(NSCursor, sel_arrow)
+        local ibeam_ptr = objc.objc_msgSend(NSCursor, sel_ibeam)
+        local hand_ptr = objc.objc_msgSend(NSCursor, sel_hand)
+        if arrow_ptr == nil or ibeam_ptr == nil or hand_ptr == nil then
+            error("Failed to resolve NSCursor singletons")
+        end
+
+        ffi_platform.objc = objc
+        ffi_platform.macos_cursor_shape = {
+            class = NSCursor,
+            sel_current = sel_current,
+            arrow = arrow_ptr,
+            ibeam = ibeam_ptr,
+            hand = hand_ptr,
+        }
+        ffi_platform.macos_cursor_shape_available = true
+    end)
+
+    return ffi_platform.macos_cursor_shape_available
+end
+
+-- Returns "default", "pointer" (hand), or "beam" (I-beam) for the current
+-- system cursor shape on macOS, or nil if unknown/unavailable/not macOS.
+-- Never throws; callers should treat nil as "use the default image".
+function ffi_platform.get_macos_cursor_kind()
+    if ffi_platform.os_type ~= "OSX" then return nil end
+    if not init_macos_cursor_shape() then return nil end
+
+    local ok, kind = pcall(function()
+        local mcs = ffi_platform.macos_cursor_shape
+        local current = ffi_platform.objc.objc_msgSend(mcs.class, mcs.sel_current)
+        if current == nil then return nil end
+        if current == mcs.ibeam then return "beam" end
+        if current == mcs.hand then return "pointer" end
+        return "default"
+    end)
+    if ok then return kind end
+    return nil
+end
+
+-- ============================================================================
+-- macOS ON-SCREEN REGION OVERLAY
+--
+-- A separate, transparent, click-through, borderless NSWindow drawn directly
+-- on the real desktop (not inside OBS) outlining the physical screen area
+-- that's currently being captured/cropped. Built from the Objective-C
+-- runtime the same way the NSCursor shape detection above is, but touches
+-- more of AppKit (NSWindow/NSView/NSColor) and needs several distinct
+-- objc_msgSend call signatures (struct args, scalar args, id args), so it's
+-- meaningfully more fragile. Every step is best-effort: any failure disables
+-- the feature for the session (no window shown) rather than erroring.
+-- ============================================================================
+
+-- Re-cast the already-loaded objc_msgSend for a specific argument/return
+-- signature. objc_msgSend is declared generically (id-returning, no args)
+-- for the NSCursor lookups above; each distinct call shape below needs its
+-- own typed function pointer cast from the same underlying symbol.
+local function objc_msgsend_as(objc, cdecl)
+    return ffi.cast(cdecl, ffi.cast("void*", objc.objc_msgSend))
+end
+
+local function init_macos_region_overlay()
+    if ffi_platform.macos_overlay_init_done then
+        return ffi_platform.macos_overlay_available
+    end
+    ffi_platform.macos_overlay_init_done = true
+    ffi_platform.macos_overlay_available = false
+
+    pcall(function()
+        -- Reuse the libobjc handle from NSCursor shape detection if that ran
+        -- first; otherwise load it fresh. Either way this doesn't need
+        -- AppKit explicitly dlopen'd: OBS is already an AppKit process, so
+        -- objc_getClass finds NSWindow/NSView/NSColor without it.
+        local objc = ffi_platform.objc
+        if not objc then
+            ffi.cdef[[
+                void* objc_getClass(const char* name);
+                void* sel_registerName(const char* name);
+                void* objc_msgSend(void* self, void* op);
+            ]]
+            objc = ffi.load("/usr/lib/libobjc.A.dylib", true)
+            ffi_platform.objc = objc
+        end
+
+        local function class(name)
+            local c = objc.objc_getClass(name)
+            if c == nil then error("class not found: " .. name) end
+            return c
+        end
+        local function sel(name) return objc.sel_registerName(name) end
+
+        -- Typed call shapes we need beyond the plain "id (id, SEL)" one.
+        local send_id = function(target, s) return objc.objc_msgSend(target, s) end
+        local send_bool = objc_msgsend_as(objc, "void (*)(void*, void*, bool)")
+        local send_double = objc_msgsend_as(objc, "void (*)(void*, void*, double)")
+        local send_ulong = objc_msgsend_as(objc, "void (*)(void*, void*, unsigned long)")
+        local send_id_arg_void = objc_msgsend_as(objc, "void (*)(void*, void*, void*)")
+        local send_rect_ulong_ulong_bool = objc_msgsend_as(objc,
+            "void* (*)(void*, void*, CGRect, unsigned long, unsigned long, bool)")
+        local send_rect_bool = objc_msgsend_as(objc, "void (*)(void*, void*, CGRect, bool)")
+
+        local NSWindow, NSView, NSColor = class("NSWindow"), class("NSView"), class("NSColor")
+
+        local sel_alloc = sel("alloc")
+        local sel_init_win = sel("initWithContentRect:styleMask:backing:defer:")
+        local sel_init_view = sel("init")
+        local sel_set_opaque = sel("setOpaque:")
+        local sel_set_bg = sel("setBackgroundColor:")
+        local sel_set_shadow = sel("setHasShadow:")
+        local sel_set_ignores_mouse = sel("setIgnoresMouseEvents:")
+        local sel_set_level = sel("setLevel:")
+        local sel_set_collection_behavior = sel("setCollectionBehavior:")
+        local sel_set_content_view = sel("setContentView:")
+        local sel_order_front = sel("orderFrontRegardless")
+        local sel_order_out = sel("orderOut:")
+        local sel_set_frame_display = sel("setFrame:display:")
+        local sel_clear_color = sel("clearColor")
+        local sel_set_wants_layer = sel("setWantsLayer:")
+        local sel_layer = sel("layer")
+        local sel_set_border_width = sel("setBorderWidth:")
+        local sel_set_border_color = sel("setBorderColor:")
+        local sel_set_corner_radius = sel("setCornerRadius:")
+
+        local zero_rect = ffi.new("CGRect", {{0, 0}, {1, 1}})
+
+        -- NSBackingStoreBuffered = 2, NSWindowStyleMaskBorderless = 0
+        local window = send_rect_ulong_ulong_bool(send_id(NSWindow, sel_alloc), sel_init_win, zero_rect, 0, 2, false)
+        if window == nil then error("failed to create overlay NSWindow") end
+
+        send_bool(window, sel_set_opaque, false)
+        send_id_arg_void(window, sel_set_bg, send_id(NSColor, sel_clear_color))
+        send_bool(window, sel_set_shadow, false)
+        send_bool(window, sel_set_ignores_mouse, true)
+        send_ulong(window, sel_set_level, 1000) -- NSScreenSaverWindowLevel: above normal app/menu-bar level
+        -- CanJoinAllSpaces (1<<0) | Stationary (1<<4) | IgnoresCycle (1<<6): stays
+        -- visible across space switches and full-screen apps, isn't itself
+        -- windowcycled/minimized.
+        send_ulong(window, sel_set_collection_behavior, 1 + 16 + 64)
+
+        local view = send_id(send_id(NSView, sel_alloc), sel_init_view)
+        -- initWithFrame: would be more correct than plain init, but the frame
+        -- is irrelevant here since the WINDOW's frame is what we resize/move;
+        -- the view just needs to fill it, which setContentView: handles.
+        send_bool(view, sel_set_wants_layer, true)
+        local layer = send_id(view, sel_layer)
+        if layer == nil then error("failed to get overlay view's layer") end
+
+        send_double(layer, sel_set_border_width, 3.0)
+        local border_color = ffi_platform.core_graphics.CGColorCreateGenericRGB(1.0, 0.0, 0.0, 0.9)
+        send_id_arg_void(layer, sel_set_border_color, border_color)
+        send_double(layer, sel_set_corner_radius, 2.0)
+
+        send_id_arg_void(window, sel_set_content_view, view)
+
+        ffi_platform.macos_overlay = {
+            window = window,
+            send_bool = send_bool,
+            send_rect_bool = send_rect_bool,
+            send_id_arg_void = send_id_arg_void,
+            sel_order_front = sel_order_front,
+            sel_order_out = sel_order_out,
+            sel_set_frame_display = sel_set_frame_display,
+            visible = false,
+        }
+        ffi_platform.macos_overlay_available = true
+    end)
+
+    return ffi_platform.macos_overlay_available
+end
+
+-- Show/move the region overlay to outline the given rect in CoreGraphics
+-- global screen coordinates (top-left origin, y-down — the same space
+-- ffi_platform.get_monitors()/CGDisplayBounds already use). Converts to
+-- Cocoa's bottom-left-origin window coordinate space internally. Best-effort:
+-- silently does nothing if the overlay isn't available.
+function ffi_platform.show_macos_region_overlay(cg_x, cg_y, cg_w, cg_h)
+    if ffi_platform.os_type ~= "OSX" then return end
+    if not init_macos_region_overlay() then return end
+    if cg_w <= 0 or cg_h <= 0 then return end
+
+    pcall(function()
+        local mo = ffi_platform.macos_overlay
+        local main_h = ffi_platform.core_graphics.CGDisplayBounds(
+            ffi_platform.core_graphics.CGMainDisplayID()).size.height
+
+        local cocoa_rect = ffi.new("CGRect", {
+            {cg_x, main_h - cg_y - cg_h},
+            {cg_w, cg_h}
+        })
+        mo.send_rect_bool(mo.window, mo.sel_set_frame_display, cocoa_rect, true)
+        if not mo.visible then
+            local objc = ffi_platform.objc
+            objc.objc_msgSend(mo.window, mo.sel_order_front)
+            mo.visible = true
+        end
+    end)
+end
+
+-- Hide the region overlay, if it exists. Best-effort/never throws; safe to
+-- call even if the overlay was never created.
+function ffi_platform.hide_macos_region_overlay()
+    if ffi_platform.os_type ~= "OSX" then return end
+    local mo = ffi_platform.macos_overlay
+    if not mo or not mo.visible then return end
+    pcall(function()
+        mo.send_id_arg_void(mo.window, mo.sel_order_out, nil)
+        mo.visible = false
+    end)
+end
+
 -- Cleanup FFI platform resources
 function ffi_platform.cleanup()
     if ffi_platform.os_type == "Linux" and ffi_platform.x11_display ~= nil then
@@ -560,7 +909,27 @@ app_state = {
     follow = {
         active = false,
         auto = false, -- "Auto-follow while zoomed" option (opt-in, default OFF)
-        speed = 0.2
+        speed = 0.2,
+        moving_until = 0 -- ms timestamp: while now < this, bypass the deadzone (see FOLLOW_CONTINUE_MS)
+    },
+    cursor_overlay = {
+        enabled = false,
+        image_default = "",
+        image_pointer = "", -- reserved: no shape detection yet, see resolve_cursor_image()
+        image_beam = "",    -- reserved: no shape detection yet, see resolve_cursor_image()
+        offset_x = 0,
+        offset_y = 0,
+        speed = 0.3,
+        item = nil,         -- scene item for the overlay image source
+        source = nil,       -- the image source itself
+        current_path = nil, -- last image file applied, to avoid redundant updates
+        smoothed_x = nil,
+        smoothed_y = nil,
+        warned_missing = false,
+        -- Click scale: shrinks the cursor overlay while a mouse button is held.
+        click_scale = 0.7,       -- target scale multiplier while left/right button is down
+        click_scale_speed = 0.25, -- ease rate toward the target scale, per tick
+        current_scale = 1.0,     -- smoothed runtime scale
     },
     source = nil,
     source_scene_item = nil, -- Scene item reference for getting transformations
@@ -590,7 +959,22 @@ app_state = {
     crop_update_threshold = DEFAULT_CROP_UPDATE_THRESHOLD,
     crop_edge_threshold = DEFAULT_CROP_EDGE_THRESHOLD,
     default_monitor_width = DEFAULT_MONITOR_WIDTH,
-    default_monitor_height = DEFAULT_MONITOR_HEIGHT
+    default_monitor_height = DEFAULT_MONITOR_HEIGHT,
+    -- Crop Resolution: restricts the working view to a centered region matching
+    -- this aspect ratio (e.g. 1080x1920 for vertical/portrait recording). Zoom
+    -- and follow operate within that region instead of the full source, and
+    -- disabling zoom returns to the center of the region rather than full frame.
+    crop_resolution_enabled = false,
+    crop_resolution_width = DEFAULT_CROP_RESOLUTION_WIDTH,
+    crop_resolution_height = DEFAULT_CROP_RESOLUTION_HEIGHT,
+    -- Where the cursor sits within the zoomed viewport: 0.5 = centered (the
+    -- old fixed behaviour). Lower = cursor nearer the top/left edge, more
+    -- content visible on the opposite side; higher = nearer bottom/right.
+    zoom_cursor_bias_x = 0.5,
+    zoom_cursor_bias_y = 0.5,
+    -- macOS-only: draws a real on-screen window outlining the currently
+    -- captured/cropped region. See ffi_platform.show/hide_macos_region_overlay.
+    region_overlay_enabled = false
 }
 
 -- Validate state consistency
@@ -1147,6 +1531,358 @@ local function map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
     return rel_x * src_w / mon_w, rel_y * src_h / mon_h
 end
 
+-- ============================================================================
+-- CURSOR OVERLAY (smoothed cursor image drawn on top of the source)
+-- ============================================================================
+
+-- Resolve the image file to draw for a given cursor "type". On macOS, "kind"
+-- is now live-detected via NSCursor (see ffi_platform.get_macos_cursor_kind);
+-- everywhere else it's always "default" (no shape detection available).
+-- If the detected kind has no image configured, falls back to "default"
+-- rather than leaving the overlay stuck on a stale image.
+local function resolve_cursor_image(kind)
+    local co = app_state.cursor_overlay
+    local user_path = ({default = co.image_default, pointer = co.image_pointer, beam = co.image_beam})[kind]
+    if user_path and user_path ~= "" then
+        return user_path
+    end
+
+    local fallback_table = DEFAULT_CURSOR_FALLBACK_PATHS[ffi_platform.os_type]
+    local fallback_path = fallback_table and fallback_table[kind]
+    if fallback_path then
+        local f = io.open(fallback_path, "rb")
+        if f then
+            f:close()
+            return fallback_path
+        end
+    end
+
+    -- Detected a non-default shape but the user hasn't supplied an image for
+    -- it: quietly use the default cursor image instead of warning/skipping.
+    if kind ~= "default" then
+        return resolve_cursor_image("default")
+    end
+
+    if not co.warned_missing then
+        log("warning", "Cursor overlay: no '" .. kind .. "' image supplied and no system default cursor "
+            .. "file could be found on this OS. Supply an image in the Cursor Overlay settings.")
+        co.warned_missing = true
+    end
+    return nil
+end
+
+-- The on-canvas box (position + size) the source's scene item currently
+-- occupies: OBS bounds-to-box scaling ("Fit to screen") if set, otherwise
+-- manual scale * visible (post-crop) content size.
+local function get_scene_item_box()
+    local item = app_state.source_scene_item
+    if not item then return nil end
+
+    local pos = obs.vec2()
+    local ok = pcall(function() obs.obs_sceneitem_get_pos(item, pos) end)
+    if not ok then return nil end
+
+    local box_w, box_h
+    local bounds_type = obs.obs_sceneitem_get_bounds_type(item)
+    if bounds_type ~= obs.OBS_BOUNDS_NONE then
+        local bounds = obs.vec2()
+        obs.obs_sceneitem_get_bounds(item, bounds)
+        box_w, box_h = bounds.x, bounds.y
+    else
+        local scale = obs.vec2()
+        obs.obs_sceneitem_get_scale(item, scale)
+        local dims = app_state._src_dims
+        local crop = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
+        local content_w = dims and math.max(1, dims.w - crop.left - crop.right) or 1
+        local content_h = dims and math.max(1, dims.h - crop.top - crop.bottom) or 1
+        box_w, box_h = content_w * scale.x, content_h * scale.y
+    end
+
+    return {x = pos.x, y = pos.y, w = box_w, h = box_h}
+end
+
+-- Map a SOURCE PIXEL coordinate (crop-relative) to canvas space using the
+-- source's on-screen box, so the overlay lines up with what's actually
+-- visible, including while zoomed in.
+local function source_point_to_canvas(px, py, view_w, view_h, crop)
+    local box = get_scene_item_box()
+    if not box or view_w <= 0 or view_h <= 0 then return nil end
+    -- Extrapolate past the visible viewport rather than clamping: once zoomed
+    -- in, the real mouse can move beyond what's currently cropped into view
+    -- (e.g. toward/off a screen edge). Pinning here made the overlay stick to
+    -- the box edge instead of continuing to track the mouse off-canvas, which
+    -- reads as "the cursor can never go negative / gets stuck at the edge".
+    local rel_x = px - crop.left
+    local rel_y = py - crop.top
+    local cx = box.x + (rel_x / view_w) * box.w
+    local cy = box.y + (rel_y / view_h) * box.h
+    return cx, cy
+end
+
+-- Create (if needed) the hidden image source used to draw the smoothed
+-- cursor overlay, placed at the top of the current scene.
+local function ensure_cursor_overlay_item()
+    local co = app_state.cursor_overlay
+    if co.item then return true end
+
+    local scene_source = obs.obs_frontend_get_current_scene()
+    if not scene_source then return false end
+    local scene = obs.obs_scene_from_source(scene_source)
+    if not scene then
+        obs.obs_source_release(scene_source)
+        return false
+    end
+
+    local img_source = obs.obs_get_source_by_name(CURSOR_OVERLAY_SOURCE_NAME)
+    local found_existing = img_source ~= nil
+    if not img_source then
+        local settings = obs.obs_data_create()
+        img_source = obs.obs_source_create("image_source", CURSOR_OVERLAY_SOURCE_NAME, settings, nil)
+        obs.obs_data_release(settings)
+    end
+    if not img_source then
+        obs.obs_source_release(scene_source)
+        return false
+    end
+
+    local item = obs.obs_scene_find_source(scene, CURSOR_OVERLAY_SOURCE_NAME)
+    if not item then
+        item = obs.obs_scene_add(scene, img_source)
+    end
+    if item then
+        obs.obs_sceneitem_set_order(item, obs.OBS_ORDER_MOVE_TOP)
+        co.item = item
+        co.source = img_source
+        co.current_path = nil
+    end
+
+    if found_existing then
+        obs.obs_source_release(img_source)
+    end
+    obs.obs_source_release(scene_source)
+    return co.item ~= nil
+end
+
+-- Remove the overlay scene item. The scene owns the item; only a source ref
+-- we explicitly hold (from obs_get_source_by_name) would need releasing, and
+-- ensure_cursor_overlay_item() already releases that immediately after use.
+local function remove_cursor_overlay_item()
+    local co = app_state.cursor_overlay
+    if co.item then
+        pcall(function() obs.obs_sceneitem_remove(co.item) end)
+        co.item = nil
+    end
+    co.source = nil
+    co.current_path = nil
+    co.smoothed_x = nil
+    co.smoothed_y = nil
+    co.current_scale = 1.0
+end
+
+-- Ease the overlay toward the raw mouse position every tick, independent of
+-- the pan deadzone, so speed < 1.0 glides smoothly instead of jumping.
+local function update_cursor_overlay()
+    local co = app_state.cursor_overlay
+    if not co.enabled then return end
+    if not ffi_platform.cursor_available then return end
+
+    -- _src_dims is normally populated by the zoom/scene-change code paths.
+    -- If the overlay is enabled without ever zooming or changing scenes,
+    -- nothing else will have set it — self-heal here. Only do this while
+    -- idle: while zoomed, the source's reported size is the POST-crop size
+    -- (the crop filter is a filter, so obs_source_get_widt1h returns its
+    -- output), and _src_dims must stay the original, uncropped size.
+    if not app_state._src_dims and app_state.source and zoom_state == "idle" then
+        local sw, sh = get_source_dimensions(app_state.source)
+        if sw > 0 and sh > 0 then
+            app_state._src_dims = {w = sw, h = sh}
+        end
+    end
+    if not app_state._src_dims then return end
+    if not ensure_cursor_overlay_item() then return end
+
+    local mx, my = ffi_platform.get_mouse_pos()
+    if not co.smoothed_x then
+        co.smoothed_x, co.smoothed_y = mx, my
+    else
+        co.smoothed_x = co.smoothed_x + (mx - co.smoothed_x) * co.speed
+        co.smoothed_y = co.smoothed_y + (my - co.smoothed_y) * co.speed
+    end
+
+    local dims = app_state._src_dims
+    local monitor = monitor_at(co.smoothed_x, co.smoothed_y)
+    local px, py = map_mouse_to_source(co.smoothed_x, co.smoothed_y, monitor, dims.w, dims.h)
+
+    local crop = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
+    local view_w = dims.w - crop.left - crop.right
+    local view_h = dims.h - crop.top - crop.bottom
+
+    local cx, cy = source_point_to_canvas(px, py, view_w, view_h, crop)
+    if not cx then return end
+
+    -- Smoothly scale the cursor down while a mouse button is held, scaling
+    -- the offset along with it so the hotspot stays anchored under the mouse
+    -- instead of drifting as the image shrinks.
+    local target_scale = ffi_platform.get_mouse_buttons() and co.click_scale or 1.0
+    co.current_scale = co.current_scale + (target_scale - co.current_scale) * co.click_scale_speed
+
+    local scale = obs.vec2()
+    scale.x, scale.y = co.current_scale, co.current_scale
+    obs.obs_sceneitem_set_scale(co.item, scale)
+
+    local pos = obs.vec2()
+    pos.x = cx + co.offset_x * co.current_scale
+    pos.y = cy + co.offset_y * co.current_scale
+    obs.obs_sceneitem_set_pos(co.item, pos)
+
+    -- On macOS, detect the live cursor shape (best-effort; nil = unknown/
+    -- unavailable, safely falls back to "default"). Every other platform
+    -- has no shape detection, so it's always "default".
+    local kind = ffi_platform.get_macos_cursor_kind() or "default"
+    local path = resolve_cursor_image(kind)
+    if path and path ~= co.current_path then
+        local settings = obs.obs_data_create()
+        obs.obs_data_set_string(settings, "file", path)
+        obs.obs_source_update(co.source, settings)
+        obs.obs_data_release(settings)
+        co.current_path = path
+    end
+end
+
+-- Compute a centered crop region matching the given target aspect ratio
+-- (crop_w x crop_h) inside a src_w x src_h source. Used to restrict the
+-- working view to e.g. a 1080x1920 vertical slice of a wider source.
+-- Returns {left, top, right, bottom} relative to the full source.
+local function compute_base_region(src_w, src_h, crop_w, crop_h)
+    if src_w <= 0 or src_h <= 0 or not crop_w or not crop_h or crop_w <= 0 or crop_h <= 0 then
+        return {left = 0, top = 0, right = 0, bottom = 0}
+    end
+
+    local target_aspect = crop_w / crop_h
+    local src_aspect = src_w / src_h
+
+    local view_w, view_h
+    if target_aspect < src_aspect then
+        -- Target is narrower than source: full height, centered width slice.
+        view_h = src_h
+        view_w = math.max(1, math.min(src_w, math.floor(src_h * target_aspect)))
+    else
+        -- Target is taller/equal than source: full width, centered height slice.
+        view_w = src_w
+        view_h = math.max(1, math.min(src_h, math.floor(src_w / target_aspect)))
+    end
+
+    local left = math.floor((src_w - view_w) / 2)
+    local top  = math.floor((src_h - view_h) / 2)
+
+    return {
+        left   = left,
+        top    = top,
+        right  = src_w - (left + view_w),
+        bottom = src_h - (top + view_h)
+    }
+end
+
+-- Returns the active base crop region: the Crop Resolution region when the
+-- feature is enabled, otherwise a zero crop (full source), preserving the
+-- pre-feature behaviour.
+local function get_active_base_crop(src_w, src_h)
+    if app_state.crop_resolution_enabled then
+        return compute_base_region(src_w, src_h, app_state.crop_resolution_width, app_state.crop_resolution_height)
+    end
+    return {left = 0, top = 0, right = 0, bottom = 0}
+end
+
+-- Applies (or removes) the Crop Resolution base crop while idle (not zoomed).
+-- Called on settings changes so toggling the "Crop Resolution" checkbox, or
+-- editing its width/height, takes effect immediately without needing to zoom.
+-- No-op while a zoom animation/follow is in progress; that path settles on
+-- the correct crop on its own via start_zoom_in/start_zoom_out/on_zoom_tick.
+local sync_region_overlay -- forward-declared; defined below, used here and in on_zoom_tick
+
+local function apply_idle_crop_state()
+    if not app_state.source or zoom_state ~= "idle" then
+        return
+    end
+
+    if app_state.crop_resolution_enabled then
+        local sw, sh = get_source_dimensions(app_state.source)
+        if sw <= 0 or sh <= 0 then
+            return
+        end
+        if not app_state.crop_filter then
+            if not apply_crop_filter(app_state.source) then
+                return
+            end
+        end
+        app_state._src_dims = {w = sw, h = sh}
+        local base = compute_base_region(sw, sh, app_state.crop_resolution_width, app_state.crop_resolution_height)
+        update_crop(base.left, base.top, base.right, base.bottom)
+        app_state.current_crop = base
+        app_state.last_crop = copy_crop(base)
+    else
+        if app_state.crop_filter and app_state.current_filter_target then
+            pcall(function()
+                obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+            end)
+            if app_state.crop_filter_owned then
+                pcall(function() obs.obs_source_release(app_state.crop_filter) end)
+            end
+            app_state.crop_filter = nil
+            app_state.crop_filter_owned = false
+            app_state.current_filter_target = nil
+        end
+        app_state.current_crop = nil
+        app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
+    end
+    pcall(sync_region_overlay)
+end
+
+-- macOS only: keep the on-screen region-outline window in sync with the
+-- current crop. Shows it whenever there's an active crop filter with a
+-- non-full-frame crop (zoomed, or idle with Crop Resolution), hides it
+-- otherwise. Reference monitor is picked the same way cursor mapping does
+-- elsewhere in this script (whichever monitor the mouse currently sits on) —
+-- best-effort, matches the existing single-monitor-source assumption.
+function sync_region_overlay()
+    if ffi_platform.os_type ~= "OSX" or not app_state.region_overlay_enabled then
+        return
+    end
+    if not app_state.crop_filter or not app_state._src_dims then
+        ffi_platform.hide_macos_region_overlay()
+        return
+    end
+
+    local crop = app_state.current_crop
+    if not crop or (crop.left == 0 and crop.top == 0 and crop.right == 0 and crop.bottom == 0) then
+        ffi_platform.hide_macos_region_overlay()
+        return
+    end
+
+    local src_w, src_h = app_state._src_dims.w, app_state._src_dims.h
+    if src_w <= 0 or src_h <= 0 then
+        ffi_platform.hide_macos_region_overlay()
+        return
+    end
+
+    local mx, my = ffi_platform.get_mouse_pos()
+    local monitor = monitor_at(mx, my)
+    local mon_w = monitor.right - monitor.left
+    local mon_h = monitor.bottom - monitor.top
+    if mon_w <= 0 or mon_h <= 0 then
+        ffi_platform.hide_macos_region_overlay()
+        return
+    end
+    local scale_x, scale_y = mon_w / src_w, mon_h / src_h
+
+    local cg_x = monitor.left + crop.left * scale_x
+    local cg_y = monitor.top + crop.top * scale_y
+    local cg_w = (src_w - crop.left - crop.right) * scale_x
+    local cg_h = (src_h - crop.top - crop.bottom) * scale_y
+
+    ffi_platform.show_macos_region_overlay(cg_x, cg_y, cg_w, cg_h)
+end
+
 -- Single named tick: handles zooming_in, zooming_out, and follow
 local function on_zoom_tick()
     if not app_state then return end
@@ -1166,6 +1902,10 @@ local function on_zoom_tick()
         zoom_timer_running = false
         return
     end
+
+    -- Cursor overlay tracks the mouse every tick regardless of zoom state.
+    pcall(update_cursor_overlay)
+    pcall(sync_region_overlay)
 
     -- === ANIMATION (zoom-in or zoom-out) ===
     if zoom_state == "zooming_in" or zoom_state == "zooming_out" then
@@ -1197,7 +1937,9 @@ local function on_zoom_tick()
                 app_state.zoom.current = app_state.zoom.value
                 zoom_state = "zoomed_in"
                 log("info", "Zoom in complete")
-                if not app_state.follow.active then
+                -- Keep the tick alive if the cursor overlay still needs it to
+                -- track the mouse, even though follow itself is static.
+                if not app_state.follow.active and not app_state.cursor_overlay.enabled then
                     obs.timer_remove(on_zoom_tick)
                     zoom_timer_running = false
                 end
@@ -1206,25 +1948,44 @@ local function on_zoom_tick()
                 -- Reset everything
                 app_state.zoom.current = 1.0
                 app_state.zoom.active = false
-                app_state.current_crop = nil
-                app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
                 zoom_state = "idle"
-                obs.timer_remove(on_zoom_tick)
-                zoom_timer_running = false
-
-                -- Remove crop filter
-                if app_state.crop_filter and app_state.current_filter_target then
-                    pcall(function()
-                        obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
-                    end)
-                    if app_state.crop_filter_owned then
-                        pcall(function() obs.obs_source_release(app_state.crop_filter) end)
-                    end
-                    app_state.crop_filter = nil
-                    app_state.crop_filter_owned = false
-                    app_state.current_filter_target = nil
+                -- Keep the tick alive if the cursor overlay still needs it to
+                -- track the mouse while idle.
+                if not app_state.cursor_overlay.enabled then
+                    obs.timer_remove(on_zoom_tick)
+                    zoom_timer_running = false
                 end
-                log("info", "Zoom out complete, filter removed")
+
+                if app_state.crop_resolution_enabled and app_state._src_dims then
+                    -- Keep the filter, but settle on the Crop Resolution base
+                    -- region (centered) instead of removing it entirely.
+                    local base = get_active_base_crop(app_state._src_dims.w, app_state._src_dims.h)
+                    update_crop(base.left, base.top, base.right, base.bottom)
+                    app_state.current_crop = base
+                    app_state.last_crop = copy_crop(base)
+                    log("info", "Zoom out complete, crop resolution base restored")
+                else
+                    app_state.current_crop = nil
+                    app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
+
+                    -- Remove crop filter
+                    if app_state.crop_filter and app_state.current_filter_target then
+                        pcall(function()
+                            obs.obs_source_filter_remove(app_state.current_filter_target, app_state.crop_filter)
+                        end)
+                        if app_state.crop_filter_owned then
+                            pcall(function() obs.obs_source_release(app_state.crop_filter) end)
+                        end
+                        app_state.crop_filter = nil
+                        app_state.crop_filter_owned = false
+                        app_state.current_filter_target = nil
+                    end
+                    log("info", "Zoom out complete, filter removed")
+                end
+                -- The timer may stop right after this (see above), so make sure
+                -- the region overlay reflects the FINAL state now rather than
+                -- whatever it was showing before this tick's crop change.
+                pcall(sync_region_overlay)
             end
         end
         return
@@ -1242,37 +2003,65 @@ local function on_zoom_tick()
         local dx = math.abs(mx - app_state.last_mouse_pos.x)
         local dy = math.abs(my - app_state.last_mouse_pos.y)
         local dist = math.sqrt(dx * dx + dy * dy)
+        local now = obs.os_gettime_ns() / 1000000
 
-        if dist < app_state.mouse_deadzone then
+        -- Only refresh the follow TARGET when the mouse has actually moved past the
+        -- deadzone; this avoids jitter from cursor-position noise while idle.
+        -- The camera itself still keeps easing toward the last target below,
+        -- regardless of whether the mouse moved this tick (so speed < 1.0 glides
+        -- to a stop instead of freezing the instant the mouse stops).
+        --
+        -- Once the mouse actually clears the deadzone, keep tracking every tick
+        -- (bypassing the deadzone) for FOLLOW_CONTINUE_MS, refreshed by further
+        -- qualifying movement. Otherwise a slow, deliberate pan under the
+        -- deadzone-per-tick threshold only updates once enough of it has
+        -- accumulated, which reads as a jerky step instead of smooth tracking.
+        if dist >= app_state.mouse_deadzone then
             app_state.last_mouse_pos = {x = mx, y = my}
-            return
+            app_state.follow.moving_until = now + FOLLOW_CONTINUE_MS
+        elseif now < app_state.follow.moving_until then
+            app_state.last_mouse_pos = {x = mx, y = my}
         end
 
         local dims = app_state._src_dims
         if not dims then return end
         local src_w, src_h = dims.w, dims.h
+        local base = get_active_base_crop(src_w, src_h)
+        local region_w = math.max(1, src_w - base.left - base.right)
+        local region_h = math.max(1, src_h - base.top - base.bottom)
 
         -- Fixed viewport size at current zoom (never changes during follow)
-        local view_w = math.max(4, math.min(math.floor(src_w / app_state.zoom.current), src_w))
-        local view_h = math.max(4, math.min(math.floor(src_h / app_state.zoom.current), src_h))
+        local view_w = math.max(4, math.min(math.floor(region_w / app_state.zoom.current), region_w))
+        local view_h = math.max(4, math.min(math.floor(region_h / app_state.zoom.current), region_h))
 
-        -- Current viewport center (derived from current_crop)
+        -- Current viewport anchor point (derived from current_crop), using the
+        -- same bias as calc_zoom_crop so follow eases toward the mouse using
+        -- the same cursor-within-viewport offset the zoom-in used.
+        local bias_x, bias_y = app_state.zoom_cursor_bias_x, app_state.zoom_cursor_bias_y
         local cur = app_state.current_crop or {left = 0, top = 0, right = 0, bottom = 0}
-        local cur_cx = cur.left + view_w / 2
-        local cur_cy = cur.top  + view_h / 2
+        local cur_cx = cur.left + view_w * bias_x
+        local cur_cy = cur.top  + view_h * bias_y
 
-        -- Target center = mouse position mapped into source pixel coords (HiDPI-safe)
-        local monitor = monitor_at(mx, my)
-        local tgt_cx, tgt_cy = map_mouse_to_source(mx, my, monitor, src_w, src_h)
+        -- Target center = last tracked mouse position mapped into source pixel coords (HiDPI-safe)
+        local tmx, tmy = app_state.last_mouse_pos.x, app_state.last_mouse_pos.y
+        local monitor = monitor_at(tmx, tmy)
+        local tgt_cx, tgt_cy = map_mouse_to_source(tmx, tmy, monitor, src_w, src_h)
+
+        -- Nothing left to ease toward; skip the update entirely.
+        if math.abs(tgt_cx - cur_cx) < 0.5 and math.abs(tgt_cy - cur_cy) < 0.5 then
+            return
+        end
 
         -- Smoothly move center toward target
         local spd = app_state.follow.speed
         local new_cx = cur_cx + (tgt_cx - cur_cx) * spd
         local new_cy = cur_cy + (tgt_cy - cur_cy) * spd
 
-        -- Convert center back to crop (clamped to source bounds)
-        local new_left = math.max(0, math.min(math.floor(new_cx - view_w / 2), src_w - view_w))
-        local new_top  = math.max(0, math.min(math.floor(new_cy - view_h / 2), src_h - view_h))
+        -- Convert center back to crop, clamped to the FULL source edges (not just
+        -- the base region) so follow can pan all the way to the edge of the
+        -- screen even when Crop Resolution constrains the idle/zoomed-out framing.
+        local new_left = math.max(0, math.min(math.floor(new_cx - view_w * bias_x), src_w - view_w))
+        local new_top  = math.max(0, math.min(math.floor(new_cy - view_h * bias_y), src_h - view_h))
         local final = {
             left   = new_left,
             top    = new_top,
@@ -1283,7 +2072,6 @@ local function on_zoom_tick()
         update_crop(final.left, final.top, final.right, final.bottom)
         app_state.last_crop = copy_crop(final)
         app_state.current_crop = final
-        app_state.last_mouse_pos = {x = mx, y = my}
     end
 end
 
@@ -1306,10 +2094,22 @@ end
 -- Pure crop math from known dimensions. Does NOT query OBS for source size
 -- (after filter_add, obs_source_get_width returns 0 for ~1 frame).
 -- Uses the shared monitor_at() / map_mouse_to_source() helpers (defined earlier).
-local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h)
-    if src_w <= 0 or src_h <= 0 or zoom_level <= 1.0 then
+-- `base` (optional) restricts the working view to a sub-region of the source
+-- (see compute_base_region); when omitted the full source is used, matching
+-- prior behaviour.
+local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h, base)
+    base = base or {left = 0, top = 0, right = 0, bottom = 0}
+
+    if src_w <= 0 or src_h <= 0 then
         return {left = 0, top = 0, right = 0, bottom = 0}
     end
+
+    if zoom_level <= 1.0 then
+        return copy_crop(base)
+    end
+
+    local region_w = math.max(1, src_w - base.left - base.right)
+    local region_h = math.max(1, src_h - base.top - base.bottom)
 
     local mx_src, my_src
     if ffi_platform.cursor_available then
@@ -1317,15 +2117,21 @@ local function calc_zoom_crop(mouse_x, mouse_y, zoom_level, src_w, src_h)
         mx_src, my_src = map_mouse_to_source(mouse_x, mouse_y, monitor, src_w, src_h)
     else
         -- No readable global cursor (Wayland, or platform init failed):
-        -- zoom to the centre of the source rather than to a bogus (0,0).
-        mx_src, my_src = src_w / 2, src_h / 2
+        -- zoom to the centre of the working region rather than to a bogus (0,0).
+        mx_src, my_src = base.left + region_w / 2, base.top + region_h / 2
     end
 
-    local view_w = math.max(4, math.min(math.floor(src_w / zoom_level), src_w))
-    local view_h = math.max(4, math.min(math.floor(src_h / zoom_level), src_h))
+    local view_w = math.max(4, math.min(math.floor(region_w / zoom_level), region_w))
+    local view_h = math.max(4, math.min(math.floor(region_h / zoom_level), region_h))
 
-    local cx = math.max(0, math.min(math.floor(mx_src - view_w / 2), src_w - view_w))
-    local cy = math.max(0, math.min(math.floor(my_src - view_h / 2), src_h - view_h))
+    -- Clamp the position to the FULL source edges (not just the base region),
+    -- so a zoomed-in viewport can slide all the way to the edge of the screen
+    -- even when Crop Resolution constrains the idle/zoomed-out framing.
+    -- The bias shifts the cursor's resting point within the viewport instead
+    -- of always centering it (e.g. bias_y < 0.5 keeps the cursor nearer the
+    -- top, showing more of what's below it).
+    local cx = math.max(0, math.min(math.floor(mx_src - view_w * app_state.zoom_cursor_bias_x), src_w - view_w))
+    local cy = math.max(0, math.min(math.floor(my_src - view_h * app_state.zoom_cursor_bias_y), src_h - view_h))
 
     return {
         left   = cx,
@@ -1356,14 +2162,15 @@ local function start_zoom_in(src_w, src_h)
 
     app_state._src_dims = {w = src_w, h = src_h}
 
-    local target = calc_zoom_crop(mx, my, app_state.zoom.value, src_w, src_h)
+    local base = get_active_base_crop(src_w, src_h)
+    local target = calc_zoom_crop(mx, my, app_state.zoom.value, src_w, src_h, base)
 
     -- If current crop exists (e.g. interrupting zoom-out), use it as start
     if app_state.last_crop and (app_state.last_crop.left ~= 0 or app_state.last_crop.top ~= 0
         or app_state.last_crop.right ~= 0 or app_state.last_crop.bottom ~= 0) then
         zoom_anim.start_crop = copy_crop(app_state.last_crop)
     else
-        zoom_anim.start_crop = {left = 0, top = 0, right = 0, bottom = 0}
+        zoom_anim.start_crop = copy_crop(base)
     end
     zoom_anim.end_crop = copy_crop(target)
     zoom_anim.start_time = obs.os_gettime_ns() / 1000000
@@ -1390,12 +2197,16 @@ local function start_zoom_in(src_w, src_h)
         zoom_anim.duration))
 end
 
--- Start smooth zoom-out: from current crop to {0,0,0,0}
+-- Start smooth zoom-out: from current crop back to the base crop (the Crop
+-- Resolution region when enabled, otherwise {0,0,0,0} = full source).
 local function start_zoom_out()
     if not app_state or app_state.cleanup_in_progress then return end
 
+    local dims = app_state._src_dims
+    local base = dims and get_active_base_crop(dims.w, dims.h) or {left = 0, top = 0, right = 0, bottom = 0}
+
     zoom_anim.start_crop = copy_crop(app_state.last_crop or {left = 0, top = 0, right = 0, bottom = 0})
-    zoom_anim.end_crop = {left = 0, top = 0, right = 0, bottom = 0}
+    zoom_anim.end_crop = base
     zoom_anim.start_time = obs.os_gettime_ns() / 1000000
     zoom_anim.duration = app_state.zoom_out_duration
     zoom_anim._start_zoom_level = app_state.zoom.current
@@ -1487,10 +2298,14 @@ local function on_zoom_hotkey(pressed)
         
         app_state.zoom.current = 1.0
         app_state.follow.active = false
-        app_state.current_crop = nil
         app_state.last_mouse_pos = {x = 0, y = 0}
-        app_state.last_crop = {left = 0, top = 0, right = 0, bottom = 0}
-        
+        app_state.last_crop = get_active_base_crop(pre_w, pre_h)
+        -- Keep current_crop in sync with last_crop (not nil/zero) so the cursor
+        -- overlay's box mapping doesn't briefly snap to a stale full-frame crop
+        -- for the one tick before the zoom-in animation starts overwriting it
+        -- (matters when Crop Resolution gives a non-zero starting crop).
+        app_state.current_crop = copy_crop(app_state.last_crop)
+
         local filter_applied = apply_crop_filter(app_state.source)
         if not filter_applied then
             log("error", "Failed to apply crop filter - zoom cancelled")
@@ -1530,7 +2345,9 @@ local function on_follow_hotkey(pressed)
         log("info", string.format("Follow activated - speed: %.2f", app_state.follow.speed))
     else
         log("info", "Follow deactivated")
-        if zoom_state == "zoomed_in" then
+        -- Keep the tick alive if the cursor overlay still needs it to track
+        -- the mouse, even though follow itself is now static.
+        if zoom_state == "zoomed_in" and not app_state.cursor_overlay.enabled then
             stop_zoom_timer()
             log("info", "Timer stopped - follow off, zoom static")
         end
@@ -1546,7 +2363,13 @@ local function on_scene_change()
     local new_scene = obs.obs_frontend_get_current_scene()
     if new_scene ~= app_state.current_scene then
         app_state.current_scene = new_scene
-        
+
+        -- The overlay image source lives in a specific scene; drop it so it
+        -- gets recreated in whichever scene is now active.
+        if app_state.cursor_overlay.enabled then
+            remove_cursor_overlay_item()
+        end
+
         -- Remove filter from previous scene if it exists
         if app_state.current_filter_target then
             local old_filter = obs.obs_source_get_filter_by_name(app_state.current_filter_target, CROP_FILTER_NAME)
@@ -1588,7 +2411,8 @@ local function on_scene_change()
                 local dims = app_state._src_dims
                 if dims then
                     local mouse_x, mouse_y = ffi_platform.get_mouse_pos()
-                    local target_crop = calc_zoom_crop(mouse_x, mouse_y, app_state.zoom.current, dims.w, dims.h)
+                    local base = get_active_base_crop(dims.w, dims.h)
+                    local target_crop = calc_zoom_crop(mouse_x, mouse_y, app_state.zoom.current, dims.w, dims.h, base)
                     update_crop(target_crop.left, target_crop.top, target_crop.right, target_crop.bottom)
                     app_state.last_crop = copy_crop(target_crop)
                     app_state.current_crop = target_crop
@@ -1598,8 +2422,21 @@ local function on_scene_change()
                     ensure_zoom_timer()
                 end
             else
-                -- If zoom wasn't active, ensure the filter is set without zoom
-                update_crop(0, 0, 0, 0)
+                -- If zoom wasn't active, ensure the filter is set without zoom,
+                -- respecting the Crop Resolution base region if enabled.
+                local sw, sh = get_source_dimensions(app_state.source)
+                if sw > 0 and sh > 0 then
+                    app_state._src_dims = {w = sw, h = sh}
+                end
+                local base = get_active_base_crop(sw, sh)
+                update_crop(base.left, base.top, base.right, base.bottom)
+                app_state.current_crop = base
+                app_state.last_crop = copy_crop(base)
+            end
+            pcall(sync_region_overlay)
+
+            if app_state.cursor_overlay.enabled then
+                ensure_zoom_timer()
             end
         else
             -- If no valid source is found, deactivate zoom
@@ -1634,6 +2471,36 @@ local function validate_settings(settings)
         log("warning", "Follow speed out of range, clamping to valid range")
         obs.obs_data_set_double(settings, "follow_speed", math.max(0.01, math.min(1.0, follow_spd)))
     end
+
+    local bias_x = obs.obs_data_get_double(settings, "zoom_cursor_bias_x")
+    if bias_x < 0.0 or bias_x > 1.0 then
+        log("warning", "Cursor horizontal position out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "zoom_cursor_bias_x", math.max(0.0, math.min(1.0, bias_x)))
+    end
+
+    local bias_y = obs.obs_data_get_double(settings, "zoom_cursor_bias_y")
+    if bias_y < 0.0 or bias_y > 1.0 then
+        log("warning", "Cursor vertical position out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "zoom_cursor_bias_y", math.max(0.0, math.min(1.0, bias_y)))
+    end
+
+    local cursor_spd = obs.obs_data_get_double(settings, "cursor_overlay_speed")
+    if cursor_spd < 0.01 or cursor_spd > 1.0 then
+        log("warning", "Cursor overlay smoothing out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "cursor_overlay_speed", math.max(0.01, math.min(1.0, cursor_spd)))
+    end
+
+    local click_scale = obs.obs_data_get_double(settings, "cursor_click_scale")
+    if click_scale < 0.1 or click_scale > 1.0 then
+        log("warning", "Cursor click scale out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "cursor_click_scale", math.max(0.1, math.min(1.0, click_scale)))
+    end
+
+    local click_scale_spd = obs.obs_data_get_double(settings, "cursor_click_scale_speed")
+    if click_scale_spd < 0.01 or click_scale_spd > 1.0 then
+        log("warning", "Cursor click scale smoothing out of range, clamping to valid range")
+        obs.obs_data_set_double(settings, "cursor_click_scale_speed", math.max(0.01, math.min(1.0, click_scale_spd)))
+    end
 end
 
 -- ============================================================================
@@ -1650,8 +2517,11 @@ local function cleanup_all_resources()
         stop_zoom_timer()
         zoom_state = "idle"
         log("info", "Zoom timer removed during cleanup")
+
+        pcall(remove_cursor_overlay_item)
+        pcall(ffi_platform.hide_macos_region_overlay)
     end
-    
+
     -- Remove crop filter (protected with pcall to prevent crashes)
     if app_state.crop_filter and app_state.current_filter_target then
         pcall(function()
@@ -1719,6 +2589,12 @@ function script_properties()
     obs.obs_properties_add_int(props, "zoom_out_duration", "Zoom Out Duration (ms)", 1, 60000, 1)
     obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1.0, 0.01)
 
+    -- Cursor position within the zoomed viewport: 0.5 = centered (default).
+    -- Lower Vertical = cursor nearer the top edge (more room visible below it);
+    -- lower Horizontal = cursor nearer the left edge, and so on.
+    obs.obs_properties_add_float_slider(props, "zoom_cursor_bias_x", "Cursor Position - Horizontal (0=Left, 0.5=Center, 1=Right)", 0.0, 1.0, 0.01)
+    obs.obs_properties_add_float_slider(props, "zoom_cursor_bias_y", "Cursor Position - Vertical (0=Top, 0.5=Center, 1=Bottom)", 0.0, 1.0, 0.01)
+
     -- Auto-follow: when ON, the viewport tracks the mouse as soon as you zoom in,
     -- without pressing the Follow hotkey. Default OFF (no change for existing users).
     obs.obs_properties_add_bool(props, "auto_follow", "Auto-follow while zoomed (no separate hotkey)")
@@ -1741,10 +2617,33 @@ function script_properties()
         obs.source_list_release(all_sources)
     end
 
+    -- Cursor overlay: draws a smoothed image at the mouse position, on top of
+    -- the source, independent of zoom/follow state.
+    local cursor_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(cursor_group, "cursor_overlay_enabled", "Enable Cursor Overlay")
+    obs.obs_properties_add_path(cursor_group, "cursor_image_default", "Default Cursor Image",
+        obs.OBS_PATH_FILE, "Images (*.png *.jpg *.jpeg *.bmp *.gif *.cur *.ico)", nil)
+    obs.obs_properties_add_path(cursor_group, "cursor_image_pointer", "Pointer Cursor Image (hand, macOS shape detection)",
+        obs.OBS_PATH_FILE, "Images (*.png *.jpg *.jpeg *.bmp *.gif *.cur *.ico)", nil)
+    obs.obs_properties_add_path(cursor_group, "cursor_image_beam", "Beam Cursor Image (text, macOS shape detection)",
+        obs.OBS_PATH_FILE, "Images (*.png *.jpg *.jpeg *.bmp *.gif *.cur *.ico)", nil)
+    obs.obs_properties_add_text(cursor_group, "cursor_overlay_notice",
+        "Cursor shape detection (swapping between Default/Pointer/Beam) is only available on macOS "
+        .. "(best-effort; falls back to Default if unavailable). Elsewhere the Default image is always used. "
+        .. "Leave an image blank to fall back to the system cursor where available (Windows only; "
+        .. "macOS has no accessible default cursor file, so a blank field there disables the overlay).",
+        obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_int(cursor_group, "cursor_offset_x", "Offset X (px, hotspot)", -2000, 2000, 1)
+    obs.obs_properties_add_int(cursor_group, "cursor_offset_y", "Offset Y (px, hotspot)", -2000, 2000, 1)
+    obs.obs_properties_add_float_slider(cursor_group, "cursor_overlay_speed", "Cursor Overlay Smoothing", 0.01, 1.0, 0.01)
+    obs.obs_properties_add_float_slider(cursor_group, "cursor_click_scale", "Click Scale (Left/Right Button Held)", 0.1, 1.0, 0.05)
+    obs.obs_properties_add_float_slider(cursor_group, "cursor_click_scale_speed", "Click Scale Smoothing", 0.01, 1.0, 0.01)
+    obs.obs_properties_add_group(props, "cursor_overlay_group", "Cursor Overlay", obs.OBS_GROUP_NORMAL, cursor_group)
+
     -- Advanced settings group
     local advanced_group = obs.obs_properties_create()
     obs.obs_properties_add_int(advanced_group, "update_interval", "Update Interval (ms)", 8, 100, 1)
-    obs.obs_properties_add_int(advanced_group, "mouse_deadzone", "Mouse Deadzone (pixels)", 1, 10, 1)
+    obs.obs_properties_add_int(advanced_group, "mouse_deadzone", "Mouse Deadzone (pixels)", 0, 500, 1)
     obs.obs_properties_add_int(advanced_group, "crop_update_threshold", "Crop Update Threshold (pixels)", 1, 10, 1)
     obs.obs_properties_add_int(advanced_group, "crop_edge_threshold", "Crop Edge Threshold (pixels)", 1, 20, 1)
     obs.obs_properties_add_int(advanced_group, "scene_transition_duration", "Scene Transition Duration (ms)", 100, 1000, 50)
@@ -1752,7 +2651,35 @@ function script_properties()
     obs.obs_properties_add_int(advanced_group, "default_monitor_width", "Default Monitor Width", 640, 7680, 1)
     obs.obs_properties_add_int(advanced_group, "default_monitor_height", "Default Monitor Height", 480, 4320, 1)
     obs.obs_properties_add_group(props, "advanced", "Advanced Settings", obs.OBS_GROUP_NORMAL, advanced_group)
-    
+
+    -- Crop Resolution: restrict the working view to a centered region of a
+    -- given aspect ratio (e.g. 1080x1920 for vertical recording). Zoom and
+    -- follow stay within that region, and disabling zoom returns to its
+    -- center instead of the full source.
+    local crop_res_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(crop_res_group, "crop_resolution_enabled", "Enable Crop Resolution")
+    obs.obs_properties_add_int(crop_res_group, "crop_resolution_width", "Crop Resolution Width", 2, 7680, 1)
+    obs.obs_properties_add_int(crop_res_group, "crop_resolution_height", "Crop Resolution Height", 2, 7680, 1)
+    obs.obs_properties_add_text(crop_res_group, "crop_resolution_notice",
+        "When enabled, the view is restricted to a centered region matching this width:height ratio "
+        .. "(e.g. 1080x1920 for vertical/portrait recording) before zoom is applied. Disabling zoom "
+        .. "returns to the center of this region instead of the full source.",
+        obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_group(props, "crop_resolution_group", "Crop Resolution", obs.OBS_GROUP_NORMAL, crop_res_group)
+
+    -- macOS-only: draws a real on-screen window outlining the physical screen
+    -- area currently being captured/cropped. Best-effort (undocumented Cocoa
+    -- APIs); silently does nothing if it fails to initialize.
+    local region_overlay_group = obs.obs_properties_create()
+    obs.obs_properties_add_bool(region_overlay_group, "region_overlay_enabled", "Enable Region Overlay (macOS only)")
+    obs.obs_properties_add_text(region_overlay_group, "region_overlay_notice",
+        "Draws a red border directly on your screen (outside OBS) around the area currently being "
+        .. "captured/cropped — handy while presenting so you can see your own capture bounds. macOS only; "
+        .. "no-op elsewhere. Best-effort: uses undocumented window APIs and silently disables itself if "
+        .. "it can't initialize.",
+        obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_group(props, "region_overlay_group", "Region Overlay", obs.OBS_GROUP_NORMAL, region_overlay_group)
+
     -- Debug
     obs.obs_properties_add_bool(props, "debug_mode", "Enable Debug Mode")
     
@@ -1765,10 +2692,23 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "zoom_animation_duration", DEFAULT_ZOOM_ANIMATION_DURATION)
     obs.obs_data_set_default_int(settings, "zoom_out_duration", DEFAULT_ZOOM_OUT_DURATION)
     obs.obs_data_set_default_double(settings, "follow_speed", 1.0)
+    obs.obs_data_set_default_double(settings, "zoom_cursor_bias_x", 0.5)
+    obs.obs_data_set_default_double(settings, "zoom_cursor_bias_y", 0.5)
     obs.obs_data_set_default_bool(settings, "auto_follow", false)
     obs.obs_data_set_default_string(settings, "preferred_source_name", "")
     obs.obs_data_set_default_bool(settings, "debug_mode", false)
-    
+
+    -- Cursor overlay defaults
+    obs.obs_data_set_default_bool(settings, "cursor_overlay_enabled", false)
+    obs.obs_data_set_default_string(settings, "cursor_image_default", "")
+    obs.obs_data_set_default_string(settings, "cursor_image_pointer", "")
+    obs.obs_data_set_default_string(settings, "cursor_image_beam", "")
+    obs.obs_data_set_default_int(settings, "cursor_offset_x", 0)
+    obs.obs_data_set_default_int(settings, "cursor_offset_y", 0)
+    obs.obs_data_set_default_double(settings, "cursor_overlay_speed", 0.3)
+    obs.obs_data_set_default_double(settings, "cursor_click_scale", 0.7)
+    obs.obs_data_set_default_double(settings, "cursor_click_scale_speed", 0.25)
+
     -- Advanced settings defaults
     obs.obs_data_set_default_int(settings, "update_interval", DEFAULT_UPDATE_INTERVAL)
     obs.obs_data_set_default_int(settings, "mouse_deadzone", DEFAULT_MOUSE_DEADZONE)
@@ -1778,6 +2718,13 @@ function script_defaults(settings)
     obs.obs_data_set_default_int(settings, "mouse_cache_duration", DEFAULT_MOUSE_CACHE_DURATION)
     obs.obs_data_set_default_int(settings, "default_monitor_width", DEFAULT_MONITOR_WIDTH)
     obs.obs_data_set_default_int(settings, "default_monitor_height", DEFAULT_MONITOR_HEIGHT)
+
+    -- Crop Resolution defaults
+    obs.obs_data_set_default_bool(settings, "crop_resolution_enabled", false)
+    obs.obs_data_set_default_int(settings, "crop_resolution_width", DEFAULT_CROP_RESOLUTION_WIDTH)
+    obs.obs_data_set_default_int(settings, "crop_resolution_height", DEFAULT_CROP_RESOLUTION_HEIGHT)
+
+    obs.obs_data_set_default_bool(settings, "region_overlay_enabled", false)
 end
 
 -- Settings update
@@ -1790,6 +2737,8 @@ function script_update(settings)
     app_state.zoom_animation_duration = obs.obs_data_get_int(settings, "zoom_animation_duration") or DEFAULT_ZOOM_ANIMATION_DURATION
     app_state.zoom_out_duration = obs.obs_data_get_int(settings, "zoom_out_duration") or DEFAULT_ZOOM_OUT_DURATION
     app_state.follow.speed = obs.obs_data_get_double(settings, "follow_speed")
+    app_state.zoom_cursor_bias_x = obs.obs_data_get_double(settings, "zoom_cursor_bias_x")
+    app_state.zoom_cursor_bias_y = obs.obs_data_get_double(settings, "zoom_cursor_bias_y")
     app_state.follow.auto = obs.obs_data_get_bool(settings, "auto_follow")
     app_state.preferred_source_name = obs.obs_data_get_string(settings, "preferred_source_name") or ""
     app_state.debug_mode = obs.obs_data_get_bool(settings, "debug_mode")
@@ -1803,11 +2752,50 @@ function script_update(settings)
     app_state.mouse_cache_duration = obs.obs_data_get_int(settings, "mouse_cache_duration") or DEFAULT_MOUSE_CACHE_DURATION
     app_state.default_monitor_width = obs.obs_data_get_int(settings, "default_monitor_width") or DEFAULT_MONITOR_WIDTH
     app_state.default_monitor_height = obs.obs_data_get_int(settings, "default_monitor_height") or DEFAULT_MONITOR_HEIGHT
-    
+
+    -- Cursor overlay
+    local co = app_state.cursor_overlay
+    local overlay_was_enabled = co.enabled
+    co.enabled = obs.obs_data_get_bool(settings, "cursor_overlay_enabled")
+    co.image_default = obs.obs_data_get_string(settings, "cursor_image_default") or ""
+    co.image_pointer = obs.obs_data_get_string(settings, "cursor_image_pointer") or ""
+    co.image_beam = obs.obs_data_get_string(settings, "cursor_image_beam") or ""
+    co.offset_x = obs.obs_data_get_int(settings, "cursor_offset_x") or 0
+    co.offset_y = obs.obs_data_get_int(settings, "cursor_offset_y") or 0
+    co.speed = obs.obs_data_get_double(settings, "cursor_overlay_speed")
+    co.click_scale = obs.obs_data_get_double(settings, "cursor_click_scale")
+    co.click_scale_speed = obs.obs_data_get_double(settings, "cursor_click_scale_speed")
+    co.warned_missing = false -- re-warn if a settings change still leaves it unresolved
+
+    if co.enabled then
+        ensure_zoom_timer()
+    else
+        if overlay_was_enabled then
+            remove_cursor_overlay_item()
+        end
+        if zoom_state == "idle" and not app_state.follow.active then
+            stop_zoom_timer()
+        end
+    end
+
     if app_state.zoom.active then
         app_state.zoom.target = app_state.zoom.value
     end
-    
+
+    -- Crop Resolution
+    app_state.crop_resolution_enabled = obs.obs_data_get_bool(settings, "crop_resolution_enabled")
+    app_state.crop_resolution_width = obs.obs_data_get_int(settings, "crop_resolution_width") or DEFAULT_CROP_RESOLUTION_WIDTH
+    app_state.crop_resolution_height = obs.obs_data_get_int(settings, "crop_resolution_height") or DEFAULT_CROP_RESOLUTION_HEIGHT
+    apply_idle_crop_state()
+
+    -- Region Overlay (macOS only; sync_region_overlay() itself is a no-op elsewhere)
+    app_state.region_overlay_enabled = obs.obs_data_get_bool(settings, "region_overlay_enabled")
+    if app_state.region_overlay_enabled then
+        pcall(sync_region_overlay)
+    else
+        pcall(ffi_platform.hide_macos_region_overlay)
+    end
+
     validate_state()
 end
 
@@ -1867,6 +2855,15 @@ function script_load(settings)
     -- Filter will be applied only when zoom is activated via hotkey
     -- This prevents issues during script reload and conflicts with other scripts
     app_state.source = find_valid_video_source()
+    if app_state.source then
+        local sw, sh = get_source_dimensions(app_state.source)
+        if sw > 0 and sh > 0 then
+            app_state._src_dims = {w = sw, h = sh}
+        end
+        if app_state.cursor_overlay.enabled then
+            ensure_zoom_timer()
+        end
+    end
     if app_state.source and app_state.debug_mode then
         log("info", "Script loaded - source found but filter not applied until zoom is activated")
     end
@@ -1891,7 +2888,10 @@ function script_unload()
         -- Stop zoom timer
         pcall(stop_zoom_timer)
         zoom_state = "idle"
-        
+
+        pcall(remove_cursor_overlay_item)
+        pcall(ffi_platform.hide_macos_region_overlay)
+
         -- Remove filter but DO NOT release source references
         -- Sources are managed by OBS, we should never release them
         if app_state.crop_filter and app_state.current_filter_target then
